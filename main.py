@@ -1,8 +1,11 @@
 # encoding:utf-8
 
 import json
-import os,re
+import os, re
 import time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from bot import bot_factory
 from bridge.bridge import Bridge
 from bridge.context import ContextType
@@ -19,6 +22,7 @@ from chatgpt_tool_hub.chains.llm import LLMChain
 from chatgpt_tool_hub.models import build_model_params
 from chatgpt_tool_hub.models.model_factory import ModelFactory
 from chatgpt_tool_hub.prompts import PromptTemplate
+
 TRANSLATE_PROMPT = '''
 You are now the following python function: 
 ```# {{translate text to commands}}"
@@ -42,6 +46,8 @@ Ensure the response can be parsed by Python json.loads.
 
 Input: {input}
 '''
+
+
 def find_json(json_string):
     json_pattern = re.compile(r"\{[\s\S]*\}")
     json_match = json_pattern.search(json_string)
@@ -50,11 +56,18 @@ def find_json(json_string):
     else:
         json_string = ""
     return json_string
-@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3.2", author="lanvent")
+
+
+@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3.2",
+                  author="lanvent")
 class Summary(Plugin):
     def __init__(self):
         super().__init__()
-        
+        self.config = super().load_config()
+        if not self.config:
+            # 未加载到配置，使用模板中的配置
+            self.config = self._load_config_template()
+        logger.info(f"[summary] inited, config={self.config}")
         curdir = os.path.dirname(__file__)
         db_path = os.path.join(curdir, "chat.db")
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -62,12 +75,17 @@ class Summary(Plugin):
         c.execute('''CREATE TABLE IF NOT EXISTS chat_records
                     (sessionid TEXT, msgid INTEGER, user TEXT, content TEXT, type TEXT, timestamp INTEGER, is_triggered INTEGER,
                     PRIMARY KEY (sessionid, msgid))''')
-        
+
+        # 创建一个总结时间表，记录合适开始了总结的时间
+        c.execute('''CREATE TABLE IF NOT EXISTS summary_time
+                    (sessionid TEXT, summary_time INTEGER, PRIMARY KEY (sessionid))''')
+
         # 后期增加了is_triggered字段，这里做个过渡，这段代码某天会删除
         c = c.execute("PRAGMA table_info(chat_records);")
+        self._setup_scheduler()
         column_exists = False
         for column in c.fetchall():
-            logger.debug("[Summary] column: {}" .format(column))
+            logger.debug("[Summary] column: {}".format(column))
             if column[1] == 'is_triggered':
                 column_exists = True
                 break
@@ -85,24 +103,91 @@ class Summary(Plugin):
         self.handlers[Event.ON_RECEIVE_MESSAGE] = self.on_receive_message
         logger.info("[Summary] inited")
 
-    def _insert_record(self, session_id, msg_id, user, content, msg_type, timestamp, is_triggered = 0):
+    def _load_config_template(self):
+        logger.debug("No summary plugin config.json, use plugins/linkai/config.json.template")
+        try:
+            plugin_config_path = os.path.join(self.path, "config.json.template")
+            if os.path.exists(plugin_config_path):
+                with open(plugin_config_path, "r", encoding="utf-8") as f:
+                    plugin_conf = json.load(f)
+                    return plugin_conf
+        except Exception as e:
+            logger.exception(e)
+
+    def _setup_scheduler(self):
+        # 创建调度器
+        self.scheduler = BackgroundScheduler()
+
+        # 清理旧记录的函数
+        def clean_old_records():
+            with self.conn:
+                self.conn.execute('''
+                    DELETE FROM chat_records
+                    WHERE timestamp < ?
+                ''', (int(time.time()) - 10 * 60,))
+                self.conn.commit()
+                logger.info("Records older have been cleaned.")
+
+        # 设置定时任务，每天凌晨12点执行
+        self.scheduler.add_job(clean_old_records, 'cron', hour=00, minute=00)
+        # 启动调度器
+        self.scheduler.start()
+        clean_old_records()
+        logger.info("Scheduler started. Cleaning old records every day at midnight.")
+
+    def _insert_record(self, session_id, msg_id, user, content, msg_type, timestamp, is_triggered=0):
         c = self.conn.cursor()
-        logger.debug("[Summary] insert record: {} {} {} {} {} {} {}" .format(session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
-        c.execute("INSERT OR REPLACE INTO chat_records VALUES (?,?,?,?,?,?,?)", (session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
+        logger.debug("[Summary] insert record: {} {} {} {} {} {} {}".format(session_id, msg_id, user, content, msg_type,
+                                                                            timestamp, is_triggered))
+        c.execute("INSERT OR REPLACE INTO chat_records VALUES (?,?,?,?,?,?,?)",
+                  (session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
         self.conn.commit()
-    
+
+    # 保存总结时间，如果表中不存在则插入，如果存在则更新
+    def _save_summary_time(self, session_id, summary_time):
+        if self._get_summary_time(session_id) is None:
+            self._insert_summary_time(session_id, summary_time)
+        else:
+            self._update_summary_time(session_id, summary_time)
+
+    # 插入总结时间
+    def _insert_summary_time(self, session_id, summary_time):
+        c = self.conn.cursor()
+        logger.debug("[Summary] insert summary time: {} {}".format(session_id, summary_time))
+        c.execute("INSERT OR REPLACE INTO summary_time VALUES (?,?)",
+                  (session_id, summary_time))
+        self.conn.commit()
+
+    # 更新总结时间
+    def _update_summary_time(self, session_id, summary_time):
+        c = self.conn.cursor()
+        logger.debug("[Summary] update summary time: {} {}".format(session_id, summary_time))
+        c.execute("UPDATE summary_time SET summary_time = ? WHERE sessionid = ?",
+                  (summary_time, session_id))
+        self.conn.commit()
+
+    # 获取总结时间，如果不存在返回None
+    def _get_summary_time(self, session_id):
+        c = self.conn.cursor()
+        c.execute("SELECT summary_time FROM summary_time WHERE sessionid=?", (session_id,))
+        row = c.fetchone()
+        if row is None:
+            return None
+        return row[0]
+
     def _get_records(self, session_id, start_timestamp=0, limit=9999):
         c = self.conn.cursor()
-        c.execute("SELECT * FROM chat_records WHERE sessionid=? and timestamp>? ORDER BY timestamp DESC LIMIT ?", (session_id, start_timestamp, limit))
+        c.execute("SELECT * FROM chat_records WHERE sessionid=? and timestamp>? ORDER BY timestamp DESC LIMIT ?",
+                  (session_id, start_timestamp, limit))
         return c.fetchall()
 
     def on_receive_message(self, e_context: EventContext):
         context = e_context['context']
-        cmsg : ChatMessage = e_context['context']['msg']
+        cmsg: ChatMessage = e_context['context']['msg']
         username = None
         session_id = cmsg.from_user_id
         if conf().get('channel_type', 'wx') == 'wx' and cmsg.from_user_nickname is not None:
-            session_id = cmsg.from_user_nickname # itchat channel id会变动，只好用群名作为session id
+            session_id = cmsg.from_user_nickname  # itchat channel id会变动，只好用群名作为session id
 
         if context.get("isgroup", False):
             username = cmsg.actual_user_nickname
@@ -115,7 +200,7 @@ class Summary(Plugin):
 
         is_triggered = False
         content = context.content
-        if context.get("isgroup", False): # 群聊
+        if context.get("isgroup", False):  # 群聊
             # 校验关键字
             match_prefix = check_prefix(content, conf().get('group_chat_prefix'))
             match_contain = check_contain(content, conf().get('group_chat_keyword'))
@@ -123,12 +208,13 @@ class Summary(Plugin):
                 is_triggered = True
             if context['msg'].is_at and not conf().get("group_at_off", False):
                 is_triggered = True
-        else: # 单聊
-            match_prefix = check_prefix(content, conf().get('single_chat_prefix',['']))
+        else:  # 单聊
+            match_prefix = check_prefix(content, conf().get('single_chat_prefix', ['']))
             if match_prefix is not None:
                 is_triggered = True
 
-        self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time, int(is_triggered))
+        self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time,
+                            int(is_triggered))
         # logger.debug("[Summary] {}:{} ({})" .format(username, context.content, session_id))
 
     def _translate_text_to_commands(self, text):
@@ -145,40 +231,40 @@ class Summary(Plugin):
         content = bot.run(text)
         return content
 
-    def _check_tokens(self, records, max_tokens=3600):
+    def _check_tokens(self, records, max_tokens=5200):
         query = ""
         for record in records[::-1]:
             username = record[2]
             content = record[3]
             is_triggered = record[6]
-            if record[4] in [str(ContextType.IMAGE),str(ContextType.VOICE)]:
+            if record[4] in [str(ContextType.IMAGE), str(ContextType.VOICE)]:
                 content = f"[{record[4]}]"
-            
+
             sentence = ""
             sentence += f'{username}' + ": \"" + content + "\""
             if is_triggered:
                 sentence += " <T>"
-            query += "\n\n"+sentence
+            query += "\n\n" + sentence
         prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的总结，用列表的形式输出。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
-        
+
         firstmsg_id = records[0][1]
         session = self.bot.sessions.build_session(firstmsg_id, prompt)
 
-        session.add_query("需要你总结的聊天记录如下：%s"%query)
-        if  session.calc_tokens() > max_tokens:
+        session.add_query("需要你总结的聊天记录如下：%s" % query)
+        if session.calc_tokens() > max_tokens:
             # logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
             return None
         return session
 
-    def _split_messages_to_summarys(self, records, max_tokens_persession=3600 , max_summarys=8):
+    def _split_messages_to_summarys(self, records, max_tokens_persession=3600, max_summarys=8):
         summarys = []
         count = 0
         self.bot.args["max_tokens"] = 400
         while len(records) > 0 and len(summarys) < max_summarys:
-            session = self._check_tokens(records,max_tokens_persession)
+            session = self._check_tokens(records, max_tokens_persession)
             last = 0
             if session is None:
-                left,right = 0, len(records)
+                left, right = 0, len(records)
                 while left < right:
                     mid = (left + right) // 2
                     logger.debug("[Summary] left: %d, right: %d, mid: %d" % (left, right, mid))
@@ -187,7 +273,7 @@ class Summary(Plugin):
                         right = mid - 1
                     else:
                         left = mid + 1
-                session = self._check_tokens(records[:left-1], max_tokens_persession)
+                session = self._check_tokens(records[:left - 1], max_tokens_persession)
                 last = left
                 logger.debug("[Summary] summary %d messages" % (left))
             else:
@@ -198,25 +284,26 @@ class Summary(Plugin):
                 break
             logger.debug("[Summary] session query: %s, prompt_tokens: %d" % (session.messages, session.calc_tokens()))
             result = self.bot.reply_text(session)
-            total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
-            logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
+            total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], \
+                result['content']
+            logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (
+                total_tokens, completion_tokens, reply_content))
             if completion_tokens == 0:
                 if len(summarys) == 0:
-                    return count,reply_content
+                    return count, reply_content
                 else:
                     break
             summary = reply_content
             summarys.append(summary)
             records = records[last:]
             count += last
-        return count,summarys
-
+        return count, summarys
 
     def on_handle_context(self, e_context: EventContext):
 
         if e_context['context'].type != ContextType.TEXT:
             return
-        
+
         content = e_context['context'].content
         logger.debug("[Summary] on_handle_context. content: %s" % content)
         trigger_prefix = conf().get('plugin_trigger_prefix', "$")
@@ -225,9 +312,22 @@ class Summary(Plugin):
             limit = 99
             duration = -1
 
+            msg: ChatMessage = e_context['context']['msg']
+            session_id = msg.from_user_id
+            if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
+                session_id = msg.from_user_nickname  # itchat channel id会变动，只好用名字作为session id
+
             if "总结" in clist[0]:
+                limit_time = self.config.get("rate_limit_summary", 60) * 1000
+                last_time = self._get_summary_time(session_id)
+                if last_time is not None and time.time() - last_time < limit_time:
+                    logger.info("[Summary] rate limit")
+                    reply = Reply(ReplyType.TEXT, "我有些累了，请稍后再试")
+                    e_context['reply'] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
                 flag = False
-                if clist[0] == trigger_prefix+"总结":
+                if clist[0] == trigger_prefix + "总结":
                     flag = True
                     if len(clist) > 1:
                         try:
@@ -236,7 +336,7 @@ class Summary(Plugin):
                         except Exception as e:
                             flag = False
                 if not flag:
-                    text = content.split(trigger_prefix,maxsplit=1)[1]
+                    text = content.split(trigger_prefix, maxsplit=1)[1]
                     try:
                         command_json = find_json(self._translate_text_to_commands(text))
                         command = json.loads(command_json)
@@ -259,15 +359,9 @@ class Summary(Plugin):
             else:
                 start_time = 0
 
-                
-
-            msg:ChatMessage = e_context['context']['msg']
-            session_id = msg.from_user_id
-            if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
-                session_id = msg.from_user_nickname # itchat channel id会变动，只好用名字作为session id
             records = self._get_records(session_id, start_time, limit)
             for i in range(len(records)):
-                record=list(records[i])
+                record = list(records[i])
                 content = record[3]
                 clist = re.split(r'\n- - - - - - - - -.*?\n', content)
                 if len(clist) > 1:
@@ -278,12 +372,12 @@ class Summary(Plugin):
                 e_context['reply'] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
-            
-            max_tokens_persession = 3600
+
+            max_tokens_persession = 4800
 
             count, summarys = self._split_messages_to_summarys(records, max_tokens_persession)
-            if count == 0 :
-                if isinstance(summarys,str):
+            if count == 0:
+                if isinstance(summarys, str):
                     reply = Reply(ReplyType.ERROR, summarys)
                 else:
                     reply = Reply(ReplyType.ERROR, "总结聊天记录失败")
@@ -291,33 +385,36 @@ class Summary(Plugin):
                 e_context.action = EventAction.BREAK_PASS
                 return
 
-
             if len(summarys) == 1:
-                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n"+summarys[0])
+                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n" + summarys[0])
                 e_context['reply'] = reply
                 e_context.action = EventAction.BREAK_PASS
+                self._save_summary_time(session_id, int(time.time()))
                 return
-            
+
             self.bot.args["max_tokens"] = None
             query = ""
-            for i,summary in enumerate(reversed(summarys)):
+            for i, summary in enumerate(reversed(summarys)):
                 query += summary + "\n----------------\n\n"
             prompt = "你是一位群聊机器人，聊天记录已经在你的大脑中被你总结成多段摘要总结，你需要对它们进行摘要总结，最后输出一篇完整的摘要总结，用列表的形式输出。\n"
-            
+            logger.debug("[Summary] query: %s" % query)
+
             session = self.bot.sessions.build_session(session_id, prompt)
             session.add_query(query)
             result = self.bot.reply_text(session)
-            total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
-            logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
+            total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], \
+                result['content']
+            logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (
+                total_tokens, completion_tokens, reply_content))
             if completion_tokens == 0:
-                reply = Reply(ReplyType.ERROR, "合并摘要失败，"+reply_content+"\n原始多段摘要如下：\n"+query)
+                reply = Reply(ReplyType.ERROR, "合并摘要失败，" + reply_content + "\n原始多段摘要如下：\n" + query)
             else:
-                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n"+reply_content)     
+                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n" + reply_content)
             e_context['reply'] = reply
-            e_context.action = EventAction.BREAK_PASS # 事件结束，并跳过处理context的默认逻辑
+            e_context.action = EventAction.BREAK_PASS  # 事件结束，并跳过处理context的默认逻辑
+            self._save_summary_time(session_id, int(time.time()))
 
-
-    def get_help_text(self, verbose = False, **kwargs):
+    def get_help_text(self, verbose=False, **kwargs):
         help_text = "聊天记录总结插件。\n"
         if not verbose:
             return help_text
