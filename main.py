@@ -23,6 +23,8 @@ from chatgpt_tool_hub.models import build_model_params
 from chatgpt_tool_hub.models.model_factory import ModelFactory
 from chatgpt_tool_hub.prompts import PromptTemplate
 
+from plugins.plugin_summary.db import Db
+
 TRANSLATE_PROMPT = '''
 You are now the following python function: 
 ```# {{translate text to commands}}"
@@ -68,33 +70,10 @@ class Summary(Plugin):
             # 未加载到配置，使用模板中的配置
             self.config = self._load_config_template()
         logger.info(f"[summary] inited, config={self.config}")
-        curdir = os.path.dirname(__file__)
-        db_path = os.path.join(curdir, "chat.db")
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        c = self.conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS chat_records
-                    (sessionid TEXT, msgid INTEGER, user TEXT, content TEXT, type TEXT, timestamp INTEGER, is_triggered INTEGER,
-                    PRIMARY KEY (sessionid, msgid))''')
-
-        # 创建一个总结时间表，记录合适开始了总结的时间
-        c.execute('''CREATE TABLE IF NOT EXISTS summary_time
-                    (sessionid TEXT, summary_time INTEGER, PRIMARY KEY (sessionid))''')
-
-        # 后期增加了is_triggered字段，这里做个过渡，这段代码某天会删除
-        c = c.execute("PRAGMA table_info(chat_records);")
-        self._setup_scheduler()
-        column_exists = False
-        for column in c.fetchall():
-            logger.debug("[Summary] column: {}".format(column))
-            if column[1] == 'is_triggered':
-                column_exists = True
-                break
-        if not column_exists:
-            self.conn.execute("ALTER TABLE chat_records ADD COLUMN is_triggered INTEGER DEFAULT 0;")
-            self.conn.execute("UPDATE chat_records SET is_triggered = 0;")
-
-        self.conn.commit()
-
+        self.db = Db()
+        save_time = self.config.get("save_time", -1)
+        if save_time > 0:
+            self._setup_scheduler()
         btype = Bridge().btype['chat']
         if btype not in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE, const.LINKAI, const.MOONSHOT]:
             raise Exception("[Summary] init failed, not supported bot type")
@@ -120,13 +99,9 @@ class Summary(Plugin):
 
         # 清理旧记录的函数
         def clean_old_records():
-            with self.conn:
-                self.conn.execute('''
-                    DELETE FROM chat_records
-                    WHERE timestamp < ?
-                ''', (int(time.time()) - 10 * 60,))
-                self.conn.commit()
-                logger.info("Records older have been cleaned.")
+            # 配置文件单位分钟，转换为秒
+            save_time = self.config.get("save_time", 12 * 60) * 60
+            self.db.delete_records(int(time.time()) - save_time)
 
         # 设置定时任务，每天凌晨12点执行
         self.scheduler.add_job(clean_old_records, 'cron', hour=00, minute=00)
@@ -134,52 +109,6 @@ class Summary(Plugin):
         self.scheduler.start()
         clean_old_records()
         logger.info("Scheduler started. Cleaning old records every day at midnight.")
-
-    def _insert_record(self, session_id, msg_id, user, content, msg_type, timestamp, is_triggered=0):
-        c = self.conn.cursor()
-        logger.debug("[Summary] insert record: {} {} {} {} {} {} {}".format(session_id, msg_id, user, content, msg_type,
-                                                                            timestamp, is_triggered))
-        c.execute("INSERT OR REPLACE INTO chat_records VALUES (?,?,?,?,?,?,?)",
-                  (session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
-        self.conn.commit()
-
-    # 保存总结时间，如果表中不存在则插入，如果存在则更新
-    def _save_summary_time(self, session_id, summary_time):
-        if self._get_summary_time(session_id) is None:
-            self._insert_summary_time(session_id, summary_time)
-        else:
-            self._update_summary_time(session_id, summary_time)
-
-    # 插入总结时间
-    def _insert_summary_time(self, session_id, summary_time):
-        c = self.conn.cursor()
-        logger.debug("[Summary] insert summary time: {} {}".format(session_id, summary_time))
-        c.execute("INSERT OR REPLACE INTO summary_time VALUES (?,?)",
-                  (session_id, summary_time))
-        self.conn.commit()
-
-    # 更新总结时间
-    def _update_summary_time(self, session_id, summary_time):
-        c = self.conn.cursor()
-        logger.debug("[Summary] update summary time: {} {}".format(session_id, summary_time))
-        c.execute("UPDATE summary_time SET summary_time = ? WHERE sessionid = ?",
-                  (summary_time, session_id))
-        self.conn.commit()
-
-    # 获取总结时间，如果不存在返回None
-    def _get_summary_time(self, session_id):
-        c = self.conn.cursor()
-        c.execute("SELECT summary_time FROM summary_time WHERE sessionid=?", (session_id,))
-        row = c.fetchone()
-        if row is None:
-            return None
-        return row[0]
-
-    def _get_records(self, session_id, start_timestamp=0, limit=9999):
-        c = self.conn.cursor()
-        c.execute("SELECT * FROM chat_records WHERE sessionid=? and timestamp>? ORDER BY timestamp DESC LIMIT ?",
-                  (session_id, start_timestamp, limit))
-        return c.fetchall()
 
     def on_receive_message(self, e_context: EventContext):
         context = e_context['context']
@@ -213,23 +142,9 @@ class Summary(Plugin):
             if match_prefix is not None:
                 is_triggered = True
 
-        self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time,
-                            int(is_triggered))
+        self.db.insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time,
+                              int(is_triggered))
         # logger.debug("[Summary] {}:{} ({})" .format(username, context.content, session_id))
-
-    def _translate_text_to_commands(self, text):
-        llm = ModelFactory().create_llm_model(**build_model_params({
-            "openai_api_key": conf().get("open_ai_api_key", ""),
-            "proxy": conf().get("proxy", ""),
-        }))
-
-        prompt = PromptTemplate(
-            input_variables=["input"],
-            template=TRANSLATE_PROMPT,
-        )
-        bot = LLMChain(llm=llm, prompt=prompt)
-        content = bot.run(text)
-        return content
 
     def _check_tokens(self, records, max_tokens=5200):
         query = ""
@@ -245,7 +160,9 @@ class Summary(Plugin):
             if is_triggered:
                 sentence += " <T>"
             query += "\n\n" + sentence
-        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的总结，用列表的形式输出。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
+        prompt = ("你是一位群聊机器人，需要对聊天记录进行简明扼要的总结，用列表的形式输出。\n聊天记录格式：["
+                  "x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$"
+                  "则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n")
 
         firstmsg_id = records[0][1]
         session = self.bot.sessions.build_session(firstmsg_id, prompt)
@@ -275,7 +192,7 @@ class Summary(Plugin):
                         left = mid + 1
                 session = self._check_tokens(records[:left - 1], max_tokens_persession)
                 last = left
-                logger.debug("[Summary] summary %d messages" % (left))
+                logger.debug("[Summary] summary %d messages" % left)
             else:
                 last = len(records)
                 logger.debug("[Summary] summary all %d messages" % (len(records)))
@@ -311,15 +228,38 @@ class Summary(Plugin):
         if clist[0].startswith(trigger_prefix):
             limit = 99
             duration = -1
-
             msg: ChatMessage = e_context['context']['msg']
             session_id = msg.from_user_id
             if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
                 session_id = msg.from_user_nickname  # itchat channel id会变动，只好用名字作为session id
 
+            # 开启指令
+            if "开启" in clist[0]:
+                self.db.save_summary_stop(session_id)
+                reply = Reply(ReplyType.TEXT, "开启成功")
+                e_context['reply'] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+
+            # 关闭指令
+            if "关闭" in clist[0]:
+                self.db.delete_summary_stop(session_id)
+                reply = Reply(ReplyType.TEXT, "关闭成功")
+                e_context['reply'] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+
             if "总结" in clist[0]:
-                limit_time = self.config.get("rate_limit_summary", 60) * 1000
-                last_time = self._get_summary_time(session_id)
+                # 如果当前群聊在黑名单中，则不允许总结
+                if session_id in self.db.disable_group:
+                    logger.info("[Summary] summary stop")
+                    reply = Reply(ReplyType.TEXT, "我不想总结了")
+                    e_context['reply'] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+
+                limit_time = self.config.get("rate_limit_summary", 60) * 60
+                last_time = self.db.get_summary_time(session_id)
                 if last_time is not None and time.time() - last_time < limit_time:
                     logger.info("[Summary] rate limit")
                     reply = Reply(ReplyType.TEXT, "我有些累了，请稍后再试")
@@ -338,7 +278,7 @@ class Summary(Plugin):
                 if not flag:
                     text = content.split(trigger_prefix, maxsplit=1)[1]
                     try:
-                        command_json = find_json(self._translate_text_to_commands(text))
+                        command_json = find_json(_translate_text_to_commands(text))
                         command = json.loads(command_json)
                         name = command["name"]
                         if name.lower() == "summary":
@@ -359,7 +299,7 @@ class Summary(Plugin):
             else:
                 start_time = 0
 
-            records = self._get_records(session_id, start_time, limit)
+            records = self.db.get_records(session_id, start_time, limit)
             for i in range(len(records)):
                 record = list(records[i])
                 content = record[3]
@@ -389,7 +329,7 @@ class Summary(Plugin):
                 reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n" + summarys[0])
                 e_context['reply'] = reply
                 e_context.action = EventAction.BREAK_PASS
-                self._save_summary_time(session_id, int(time.time()))
+                self.db.save_summary_time(session_id, int(time.time()))
                 return
 
             self.bot.args["max_tokens"] = None
@@ -412,7 +352,16 @@ class Summary(Plugin):
                 reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n" + reply_content)
             e_context['reply'] = reply
             e_context.action = EventAction.BREAK_PASS  # 事件结束，并跳过处理context的默认逻辑
-            self._save_summary_time(session_id, int(time.time()))
+            self.db.save_summary_time(session_id, int(time.time()))
+
+    def _translate_text_to_commands(self, text):
+        # 随机的session id
+        session_id = str(time.time())
+        session = self.bot.sessions.build_session(session_id, system_prompt=TRANSLATE_PROMPT)
+        session.add_query(text)
+        content = self.bot.reply_text(session)
+        logger.debug("_translate_text_to_commands: %s" % content)
+        return content
 
     def get_help_text(self, verbose=False, **kwargs):
         help_text = "聊天记录总结插件。\n"
