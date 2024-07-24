@@ -5,6 +5,14 @@
 
 该插件也是用户根据需求开发自定义插件的示例插件，参考[插件开发说明](https://github.com/zhayujie/chatgpt-on-wechat/tree/master/plugins)
 
+## 安装
+使用管理员口令在线安装即可，参考这里去如何[认证管理员](https://www.wangpc.cc/aigc/chatgpt-on-wechat_plugin/)！
+
+```
+#installp https://github.com/sineom-1/plugin_summary.git
+```
+安装成功后，根据提示使用#scanp命令来扫描新插件，再使用#enablep summary
+
 ## 插件配置
 
 将 `plugins/plugin_summary` 目录下的 `config.json.template` 配置模板复制为最终生效的 `config.json`。 (如果未配置则会默认使用`config.json.template`模板中配置)。
