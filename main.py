@@ -276,7 +276,7 @@ class Summary(Plugin):
                 if not flag:
                     text = content.split(trigger_prefix, maxsplit=1)[1]
                     try:
-                        command_json = find_json(_translate_text_to_commands(text))
+                        command_json = find_json(self._translate_text_to_commands(text))
                         command = json.loads(command_json)
                         name = command["name"]
                         if name.lower() == "summary":
