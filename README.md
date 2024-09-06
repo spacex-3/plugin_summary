@@ -11,7 +11,7 @@
 ```
 #installp https://github.com/sineom-1/plugin_summary.git
 ```
-安装成功后，根据提示使用#scanp命令来扫描新插件，再使用#enablep summary
+安装成功后，根据提示使用#scanp命令来扫描新插件，再使用#enablep summaryv2
 
 ## 插件配置
 
